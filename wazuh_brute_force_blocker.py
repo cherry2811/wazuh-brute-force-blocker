@@ -1,34 +1,67 @@
-#!/usr/bin/env python3
-
-import re
+import json
+import sys
 import subprocess
-from collections import defaultdict
+import logging
 
-# Log file path
-log_file = "/var/log/auth.log"
+# Setup logging
+logging.basicConfig(
+    filename='/home/charan/wazuh-brute-force-blocker/blocker.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
-# Failed login regex (IPv4)
-failed_login_regex = r"Failed password for .* from (\d+\.\d+\.\d+\.\d+) port"
+def block_ip(ip):
+    try:
+        # Run iptables command to block IP
+        subprocess.run(['iptables', '-A', 'INPUT', '-s', ip, '-j', 'DROP'], check=True)
+        logging.info(f"Blocked IP: {ip}")
+        print(f"[!] Blocking IP: {ip}")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Failed to block IP {ip}: {e}")
+        print(f"[!] Error blocking IP {ip}")
 
-# Threshold for brute-force
-threshold = 3
+def main(alerts_file):
+    failed_attempts = {}
 
-# Store IPs and failed count
-ip_attempts = defaultdict(int)
+    try:
+        with open(alerts_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    alert = json.loads(line)
+                except json.JSONDecodeError:
+                    logging.warning("Skipping invalid JSON line")
+                    continue
 
-# Read and parse the log
-with open(log_file, 'r', errors='ignore') as f:
-    for line in f:
-        match = re.search(failed_login_regex, line)
-        if match:
-            ip = match.group(1)
-            ip_attempts[ip] += 1
+                rule = alert.get('rule', {})
+                rule_id = rule.get('id', rule.get('id'))  # Adjust if needed
+                src_ip = alert.get('srcip')
 
-# Block IPs that exceed threshold
-for ip, count in ip_attempts.items():
-    if count >= threshold:
-        print(f"[!] Blocking IP: {ip} - Failed attempts: {count}")
-        try:
-            subprocess.run(["sudo", "iptables", "-A", "INPUT", "-s", ip, "-j", "DROP"], check=True)
-        except subprocess.CalledProcessError as e:
-            print(f"[!] Error blocking IP {ip}: {e}")
+                logging.debug(f"Processing alert: rule id = {rule_id}, src_ip = {src_ip}")
+
+                if not src_ip:
+                    continue
+
+                # Check for brute force or failed login rule ids (example: 5716)
+                if rule_id == 5716:
+                    failed_attempts[src_ip] = failed_attempts.get(src_ip, 0) + 1
+
+                    if failed_attempts[src_ip] >= 5:  # threshold
+                        block_ip(src_ip)
+
+    except FileNotFoundError:
+        logging.error(f"Alerts file not found: {alerts_file}")
+        print(f"[!] Alerts file not found: {alerts_file}")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+        print(f"[!] Unexpected error: {e}")
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python3 wazuh_brute_force_blocker.py /path/to/alerts.json")
+        sys.exit(1)
+
+    alerts_path = sys.argv[1]
+    main(alerts_path)
